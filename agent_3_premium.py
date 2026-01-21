@@ -1,10 +1,24 @@
+
+"""
+AGENTE 3: ENRICHER PREMIUM
+SalesMachine v4.2
+
+Correções:
+- CrustData com lógica ORIGINAL (mais rica)
+- CNPJ/BrasilAPI para TODOS (PME e Enterprise)
+- NÃO apaga mensagem ao gerar copies (envia nova)
+- format_person_profile_full() com histórico
+- Fluxo em 2 partes preservado
+"""
+
 import os
 import json
 import requests
-import threading
 import datetime
 import traceback
 import re
+import zlib
+import base64
 from google.cloud import pubsub_v1
 from google.cloud import firestore
 from dotenv import load_dotenv
@@ -18,25 +32,47 @@ except ImportError:
     class database:
         @staticmethod
         def update_enrichment(domain, data): pass
+        @staticmethod
+        def get_cnpj_cache(cnpj): return None
+        @staticmethod
+        def save_cnpj_cache(cnpj, data): pass
 
 load_dotenv()
-print("\n💎 --- AGENTE 3: ENRICHER (V5.9 - Stability Patch) ---")
+print("\n💎 --- AGENTE 3: ENRICHER (V4.2 - Full Features) ---")
 
-# --- Configurações ---
+# ==============================================================================
+# ⚙️ CONFIGURAÇÃO
+# ==============================================================================
+
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CRUST_API_KEY = os.getenv("CRUST_API_KEY")
+DEBUG_CHAT_ID = os.getenv("DEBUG_CHAT_ID")
 
+# API Keys
+CRUST_API_KEY = os.getenv("CRUST_API_KEY")
+APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
+LUSHA_API_KEY = os.getenv("LUSHA_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+
+# URLs
+CRUST_BASE_URL = "https://api.crustdata.com"
+
+# Pub/Sub
 SUBSCRIPTION_INPUT = "sub-enricher-worker"
 TOPIC_CLOSER = "topic-closer-hubspot"
-BASE_URL = "https://api.crustdata.com"
+TOPIC_COPY = "topic-copy-generator"
 
-# --- GCP Setup ---
 publisher = pubsub_v1.PublisherClient()
 subscriber = pubsub_v1.SubscriberClient()
 topic_path_closer = publisher.topic_path(PROJECT_ID, TOPIC_CLOSER)
+topic_path_copy = publisher.topic_path(PROJECT_ID, TOPIC_COPY)
 subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_INPUT)
+
+# Firestore
 db_firestore = firestore.Client(project=PROJECT_ID)
+
+# Limites
+MAX_SERPER_CALLS = 5
 
 # ==============================================================================
 # 🛠️ UTILITÁRIOS
@@ -44,28 +80,55 @@ db_firestore = firestore.Client(project=PROJECT_ID)
 
 def clean_markdown(text):
     """Remove caracteres que quebram o Markdown"""
-    if not text: return ""
-    return text.replace("_", " ").replace("*", " ").replace("`", "'").replace("[", "(").replace("]", ")")
+    if not text:
+        return ""
+    return str(text).replace("_", " ").replace("*", " ").replace("`", "'").replace("[", "(").replace("]", ")")
+
 
 def parse_date_ym(date_str):
-    if not date_str: return None
+    """Converte data para formato YYYY-MM"""
+    if not date_str:
+        return None
     try:
         return datetime.datetime.fromisoformat(date_str.replace("Z", "")).strftime("%Y-%m")
-    except: return date_str
+    except:
+        return date_str
+
+
+def decompress_html(compressed_str):
+    """Descomprime HTML que veio do Agente 2"""
+    if not compressed_str:
+        return ""
+    try:
+        compressed_bytes = base64.b64decode(compressed_str)
+        html_bytes = zlib.decompress(compressed_bytes)
+        return html_bytes.decode('utf-8')
+    except:
+        return ""
+
 
 def format_person_profile_full(person):
-    """Gera o card rico do funcionário"""
+    """
+    Gera o card rico do funcionário (FORMATO ORIGINAL DO CRUSTDATA)
+    Inclui histórico de empregos
+    """
     name = clean_markdown(person.get("full_name") or person.get("name"))
     linkedin = person.get("linkedin_profile_url") or person.get("linkedin_url")
     location = clean_markdown(person.get("city") or person.get("location_city") or person.get("location"))
+    email = person.get("email")
+    phone = person.get("phone")
+    faixa_etaria = person.get("faixa_etaria")
 
     employers = person.get("employer") or []
-    if not isinstance(employers, list): employers = []
+    if not isinstance(employers, list):
+        employers = []
 
     current = None
     if employers:
         for e in employers:
-            if e.get("is_default"): current = e; break
+            if e.get("is_default"):
+                current = e
+                break
         if current is None and employers:
             current = sorted(employers, key=lambda e: e.get("start_date") or "", reverse=True)[0]
 
@@ -74,71 +137,123 @@ def format_person_profile_full(person):
     # 1. Header
     if current:
         title = clean_markdown(current.get("title"))
-        c_name = clean_markdown(current.get("company_name"))
         line1 = f"👤 *{name}* — {title}"
-        if location: line1 += f" ({location})"
+        if location:
+            line1 += f" ({location})"
     else:
-        line1 = f"👤 *{name or 'Contato'}*"
+        title = person.get("title") or person.get("cargo") or ""
+        if title:
+            line1 = f"👤 *{name}* — {clean_markdown(title)}"
+        else:
+            line1 = f"👤 *{name or 'Contato'}*"
+        if location:
+            line1 += f" ({location})"
     lines.append(line1)
 
-    # 2. Descrição
+    # 2. Faixa etária (se vier do BrasilAPI)
+    if faixa_etaria:
+        lines.append(f"   📅 {faixa_etaria}")
+
+    # 3. Descrição/Start date
     if current:
         start = parse_date_ym(current.get("start_date"))
         base = f"Start: {start}" if start else "Atual"
         desc = current.get("description") or person.get("headline") or person.get("summary")
         if desc:
             clean_desc = clean_markdown(desc.strip().replace("\n", " "))
-            if len(clean_desc) > 120: clean_desc = clean_desc[:117] + "..."
+            if len(clean_desc) > 120:
+                clean_desc = clean_desc[:117] + "..."
             lines.append(f"   _{base} | {clean_desc}_")
         else:
             lines.append(f"   _{base}_")
 
-    # 3. Histórico
+    # 4. Histórico de empregos
     if employers:
         sorted_emp = sorted(employers, key=lambda e: e.get("start_date") or "", reverse=True)
         hist_lines = []
         count = 0
         for e in sorted_emp:
-            if current and e is current: continue
+            if current and e is current:
+                continue
             s = parse_date_ym(e.get("start_date"))
             end = parse_date_ym(e.get("end_date")) or "atual"
             tit = clean_markdown(e.get("title"))
             cmp = clean_markdown(e.get("company_name"))
             hist_lines.append(f"   • {s if s else '?'} - {end}: {tit} @ {cmp}")
             count += 1
-            if count >= 3: break
+            if count >= 3:
+                break
         
         if hist_lines:
             lines.append("   📜 *Histórico:*")
             lines.extend(hist_lines)
 
+    # 5. Contatos
+    if email:
+        lines.append(f"   📧 {clean_markdown(email)}")
+    if phone:
+        lines.append(f"   📞 {clean_markdown(phone)}")
     if linkedin:
         lines.append(f"   🔗 [LinkedIn]({linkedin})")
 
     return "\n".join(lines)
 
+
 # ==============================================================================
 # 📡 TELEGRAM
 # ==============================================================================
 
+def send_telegram(chat_id, text, reply_markup=None):
+    """Envia mensagem no Telegram"""
+    if not TELEGRAM_TOKEN or not chat_id:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("message_id")
+        else:
+            # Tenta sem Markdown se falhar
+            payload["parse_mode"] = None
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get("result", {}).get("message_id")
+    except Exception as e:
+        print(f"⚠️ Erro Telegram: {e}")
+    return None
+
+
 def send_telegram_preview(chat_id, text, domain):
+    """Envia preview com botões de ação"""
     keyboard = {
         "inline_keyboard": [[
-            {"text": "👥 Enriquecer Funcionários", "callback_data": f"ENRICH:{domain}"},
+            {"text": "👥 Enriquecer Pessoas", "callback_data": f"ENRICH:{domain}"},
             {"text": "🗑 Descartar", "callback_data": f"DISCARD:{domain}"}
         ]]
     }
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "reply_markup": keyboard})
-        if r.status_code != 200:
-            requests.post(url, json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
-    except: pass
+    return send_telegram(chat_id, text, keyboard)
+
 
 def edit_msg_final(chat_id, msg_id, text):
+    """Edita mensagem existente"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
     try:
-        payload = {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+        payload = {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
         r = requests.post(url, json=payload)
         if r.status_code != 200:
             payload["parse_mode"] = None
@@ -146,48 +261,197 @@ def edit_msg_final(chat_id, msg_id, text):
     except Exception as e:
         print(f"⚠️ Falha envio Telegram: {e}")
 
+
+def send_new_message_with_copies_button(chat_id, text, domain):
+    """
+    Envia NOVA mensagem com botão de gerar copies
+    NÃO edita a mensagem anterior
+    """
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "🚀 Gerar Copies", "callback_data": f"COPIES:{domain}"},
+            {"text": "📋 Ver no HubSpot", "callback_data": f"HUBSPOT:{domain}"}
+        ]]
+    }
+    return send_telegram(chat_id, text, keyboard)
+
+
 # ==============================================================================
-# 📡 CRUST DATA (Blindado contra NoneType)
+# 🔍 EXTRAÇÃO DE CNPJ
+# ==============================================================================
+
+def extract_cnpj_from_html(html_content):
+    """Extrai CNPJ do HTML usando regex"""
+    if not html_content:
+        return None
+    
+    patterns = [
+        r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}',
+        r'\d{2}\s?\.\s?\d{3}\s?\.\s?\d{3}\s?/\s?\d{4}\s?-\s?\d{2}',
+        r'CNPJ[:\s]*(\d{2}\.?\d{3}\.?\d{3}/?\.?\d{4}-?\d{2})',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, html_content, re.IGNORECASE)
+        if matches:
+            for match in matches:
+                cnpj_clean = "".join(filter(str.isdigit, str(match)))
+                if len(cnpj_clean) == 14:
+                    print(f"   📋 CNPJ encontrado: {cnpj_clean[:8]}...")
+                    return cnpj_clean
+    return None
+
+
+def search_cnpj_serper(company_name, domain):
+    """Busca CNPJ via Serper quando não encontrou no site"""
+    if not SERPER_API_KEY or not company_name:
+        return None
+    
+    try:
+        query = f"{company_name} CNPJ site:cnpj.info OR site:consultasocio.com"
+        url = "https://google.serper.dev/search"
+        headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+        
+        resp = requests.post(url, headers=headers, json={"q": query, "num": 5, "gl": "br"}, timeout=10)
+        
+        if resp.status_code == 200:
+            for result in resp.json().get("organic", []):
+                snippet = result.get("snippet", "") + result.get("title", "")
+                cnpj = extract_cnpj_from_html(snippet)
+                if cnpj:
+                    print(f"   📋 CNPJ via Serper: {cnpj[:8]}...")
+                    return cnpj
+    except Exception as e:
+        print(f"   ⚠️ Serper CNPJ erro: {e}")
+    return None
+
+
+# ==============================================================================
+# 🇧🇷 BRASIL API
+# ==============================================================================
+
+def fetch_brasil_api(cnpj):
+    """Consulta BrasilAPI para dados do CNPJ"""
+    if not cnpj:
+        return None
+    
+    cnpj_limpo = "".join(filter(str.isdigit, str(cnpj)))
+    if len(cnpj_limpo) != 14:
+        return None
+    
+    # Cache
+    cached = database.get_cnpj_cache(cnpj_limpo)
+    if cached:
+        print(f"   📦 CNPJ Cache hit")
+        return cached
+    
+    try:
+        url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_limpo}"
+        resp = requests.get(url, timeout=15)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            database.save_cnpj_cache(cnpj_limpo, data)
+            print(f"   ✅ BrasilAPI: {data.get('razao_social', 'OK')[:30]}...")
+            return data
+        elif resp.status_code == 404:
+            print(f"   ⚠️ CNPJ não encontrado na Receita")
+    except Exception as e:
+        print(f"   ⚠️ BrasilAPI erro: {e}")
+    return None
+
+
+def extract_socios_from_brasil_api(brasil_data):
+    """Extrai sócios do QSA da BrasilAPI"""
+    if not brasil_data:
+        return []
+    
+    qsa = brasil_data.get("qsa", [])
+    socios = []
+    
+    # Prioriza sócio-administrador
+    sorted_qsa = sorted(qsa, key=lambda x: (
+        0 if "ADMINISTRADOR" in str(x.get("qualificacao_socio", "")).upper() else 1
+    ))
+    
+    for socio in sorted_qsa[:5]:
+        nome = socio.get("nome_socio", "")
+        if nome and nome.strip():
+            socios.append({
+                "nome": nome.title(),
+                "qualificacao": socio.get("qualificacao_socio", "Sócio"),
+                "faixa_etaria": socio.get("faixa_etaria"),
+                "data_entrada": socio.get("data_entrada_sociedade")
+            })
+    return socios
+
+
+# ==============================================================================
+# 🦀 CRUST DATA (LÓGICA ORIGINAL - RICA)
 # ==============================================================================
 
 def enrich_company_basic(domain):
-    if not CRUST_API_KEY: return None
+    """Busca dados da empresa no CrustData"""
+    if not CRUST_API_KEY:
+        return None
     try:
-        url = f"{BASE_URL}/screener/company"
-        resp = requests.get(url, headers={"Authorization": f"Token {CRUST_API_KEY}"}, params={"company_domain": domain}, timeout=30)
+        url = f"{CRUST_BASE_URL}/screener/company"
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Token {CRUST_API_KEY}"},
+            params={"company_domain": domain},
+            timeout=30
+        )
         if resp.status_code == 200:
             data = resp.json()
             return data[0] if isinstance(data, list) and len(data) > 0 else None
-    except: pass
+    except Exception as e:
+        print(f"   ⚠️ CrustData Company erro: {e}")
     return None
 
+
 def get_decision_makers_by_id(company_id):
-    """Retorna lista vazia se falhar, nunca None"""
-    if not company_id or not CRUST_API_KEY: return []
+    """
+    Busca decision makers pelo ID da empresa no CrustData
+    Retorna lista vazia se falhar, nunca None
+    """
+    if not company_id or not CRUST_API_KEY:
+        return []
     try:
-        url = f"{BASE_URL}/screener/company"
+        url = f"{CRUST_BASE_URL}/screener/company"
         params = {"company_id": str(company_id), "fields": "decision_makers"}
-        resp = requests.get(url, headers={"Authorization": f"Token {CRUST_API_KEY}"}, params=params, timeout=20)
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Token {CRUST_API_KEY}"},
+            params=params,
+            timeout=20
+        )
         if resp.status_code == 200:
             data = resp.json()
-            if isinstance(data, list) and data: 
-                return data[0].get("decision_makers") or [] # Garante lista
-            elif isinstance(data, dict): 
-                return data.get("decision_makers") or [] # Garante lista
+            if isinstance(data, list) and data:
+                return data[0].get("decision_makers") or []
+            elif isinstance(data, dict):
+                return data.get("decision_makers") or []
     except Exception as e:
-        print(f"⚠️ Erro ID Search: {e}")
-    return [] # Sempre retorna lista
+        print(f"   ⚠️ CrustData DMs erro: {e}")
+    return []
+
 
 def search_people_robust(company_key, titles_list=None, limit=5):
-    """Retorna lista vazia se falhar, nunca None"""
-    if not company_key or not CRUST_API_KEY: return []
-    url = f"{BASE_URL}/screener/person/search/"
+    """
+    Busca pessoas no CrustData com filtros de título
+    LÓGICA ORIGINAL - retorna dados ricos
+    """
+    if not company_key or not CRUST_API_KEY:
+        return []
+    
+    url = f"{CRUST_BASE_URL}/screener/person/search/"
     headers = {"Authorization": f"Token {CRUST_API_KEY}", "Content-Type": "application/json"}
     
     filters = [{"filter_type": "CURRENT_COMPANY", "type": "in", "value": [company_key]}]
     if titles_list:
         filters.append({"filter_type": "CURRENT_TITLE", "type": "contains_any", "value": titles_list})
-        
+    
     try:
         resp = requests.post(url, headers=headers, json={"filters": filters, "limit": limit}, timeout=25)
         if resp.status_code == 200:
@@ -195,25 +459,212 @@ def search_people_robust(company_key, titles_list=None, limit=5):
             res = data.get("results") or data.get("profiles")
             return res if res else []
     except Exception as e:
-        print(f"⚠️ Erro Search: {e}")
-    return [] # Sempre retorna lista
+        print(f"   ⚠️ CrustData Search erro: {e}")
+    return []
+
 
 # ==============================================================================
-# 🔄 PARTE 1
+# 🚀 APOLLO API (FALLBACK)
+# ==============================================================================
+
+def apollo_organization_search(domain):
+    """Busca dados da empresa no Apollo"""
+    if not APOLLO_API_KEY:
+        return None
+    try:
+        url = "https://api.apollo.io/v1/organizations/search"
+        payload = {
+            "api_key": APOLLO_API_KEY,
+            "q_organization_domains": domain,
+            "page": 1,
+            "per_page": 1
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            orgs = resp.json().get("organizations", [])
+            if orgs:
+                org = orgs[0]
+                return {
+                    "name": org.get("name"),
+                    "linkedin_url": org.get("linkedin_url"),
+                    "phone": org.get("phone"),
+                    "employee_count": org.get("estimated_num_employees"),
+                    "industry": org.get("industry"),
+                    "founded_year": org.get("founded_year")
+                }
+    except Exception as e:
+        print(f"   ⚠️ Apollo Org erro: {e}")
+    return None
+
+
+def apollo_people_search(domain, titles=None, limit=5):
+    """Busca pessoas no Apollo"""
+    if not APOLLO_API_KEY:
+        return []
+    try:
+        url = "https://api.apollo.io/v1/mixed_people/search"
+        payload = {
+            "api_key": APOLLO_API_KEY,
+            "q_organization_domains": domain,
+            "page": 1,
+            "per_page": limit
+        }
+        if titles:
+            payload["person_titles"] = titles
+        
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            people = []
+            for p in resp.json().get("people", []):
+                people.append({
+                    "name": p.get("name"),
+                    "full_name": p.get("name"),
+                    "title": p.get("title"),
+                    "linkedin_url": p.get("linkedin_url"),
+                    "linkedin_profile_url": p.get("linkedin_url"),
+                    "email": p.get("email"),
+                    "phone": p.get("phone_numbers", [{}])[0].get("sanitized_number") if p.get("phone_numbers") else None,
+                    "source": "apollo"
+                })
+            return people
+    except Exception as e:
+        print(f"   ⚠️ Apollo People erro: {e}")
+    return []
+
+
+# ==============================================================================
+# 🔮 LUSHA API (FALLBACK)
+# ==============================================================================
+
+def lusha_people_search(domain, titles=None, limit=5):
+    """Busca pessoas no Lusha"""
+    if not LUSHA_API_KEY:
+        return []
+    try:
+        url = "https://api.lusha.com/prospecting/contact/search"
+        headers = {"api_key": LUSHA_API_KEY, "Content-Type": "application/json"}
+        
+        filters = {
+            "companies": {"include": {"fqdn": [domain]}},
+            "contacts": {"include": {}}
+        }
+        if titles:
+            filters["contacts"]["include"]["jobTitles"] = titles
+        
+        payload = {"filters": filters, "pages": {"page": 0, "size": limit}, "includePartialContact": True}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        
+        if resp.status_code == 200:
+            people = []
+            for c in resp.json().get("contacts", []):
+                people.append({
+                    "name": c.get("name"),
+                    "full_name": c.get("name"),
+                    "title": c.get("jobTitle"),
+                    "linkedin_url": c.get("linkedinUrl"),
+                    "linkedin_profile_url": c.get("linkedinUrl"),
+                    "email": c.get("email") if c.get("hasEmails") else None,
+                    "phone": c.get("phone") if c.get("hasPhones") else None,
+                    "source": "lusha"
+                })
+            return people
+    except Exception as e:
+        print(f"   ⚠️ Lusha erro: {e}")
+    return []
+
+
+# ==============================================================================
+# 🔍 SERPER (LinkedIn Search para sócios)
+# ==============================================================================
+
+def search_linkedin_serper(name, company_name):
+    """Busca perfil LinkedIn via Serper"""
+    if not SERPER_API_KEY or not name:
+        return None
+    try:
+        query = f'"{name}" {company_name} site:linkedin.com/in'
+        url = "https://google.serper.dev/search"
+        headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+        
+        resp = requests.post(url, headers=headers, json={"q": query, "num": 3, "gl": "br"}, timeout=10)
+        
+        if resp.status_code == 200:
+            for result in resp.json().get("organic", []):
+                link = result.get("link", "")
+                if "linkedin.com/in/" in link:
+                    print(f"   🔗 LinkedIn: {link[:50]}...")
+                    return link
+    except Exception as e:
+        print(f"   ⚠️ Serper LinkedIn erro: {e}")
+    return None
+
+
+# ==============================================================================
+# 📊 CLASSIFICAÇÃO DE PORTE
+# ==============================================================================
+
+def classify_porte(brasil_data, employee_count):
+    """Classifica empresa como PME ou Enterprise"""
+    if brasil_data:
+        porte = brasil_data.get("porte", "").upper()
+        if porte in ["MEI", "MICRO EMPRESA", "MICROEMPRESA", "EMPRESA DE PEQUENO PORTE"]:
+            return "pme"
+        if porte in ["DEMAIS", "GRANDE", "MEDIO"]:
+            return "enterprise"
+    
+    if employee_count:
+        try:
+            if int(employee_count) < 25:
+                return "pme"
+            return "enterprise"
+        except:
+            pass
+    
+    return "enterprise"
+
+
+# ==============================================================================
+# 🎯 PARTE 1: PREVIEW DO LEAD
 # ==============================================================================
 
 def process_new_lead_part1(data):
+    """
+    PARTE 1: Recebe lead do Agente 2, busca dados da empresa e envia preview
+    """
     domain = data.get("domain")
     chat_id = data.get("chat_id")
     techs = data.get("techs", [])
     tech_summary = data.get("tech_summary", {})
     tech_score = data.get("tech_score", 0)
+    context_data = data.get("context_data", {})
+    html_compressed = data.get("html_compressed", "")
+    site_emails = data.get("site_emails", [])
+    site_socials = data.get("site_socials", [])
     
     print(f"\n🔵 [Parte 1] Analisando Empresa: {domain}")
     
+    # 1. Descomprime HTML
+    html_content = decompress_html(html_compressed)
+    
+    # 2. Extrai CNPJ (PARA TODOS - PME E ENTERPRISE)
+    cnpj = extract_cnpj_from_html(html_content)
+    if not cnpj:
+        company_name = context_data.get("name", domain.split(".")[0])
+        cnpj = search_cnpj_serper(company_name, domain)
+    
+    # 3. Consulta BrasilAPI (PARA TODOS)
+    brasil_data = None
+    socios = []
+    if cnpj:
+        brasil_data = fetch_brasil_api(cnpj)
+        if brasil_data:
+            socios = extract_socios_from_brasil_api(brasil_data)
+    
+    # 4. Busca dados no CrustData (LÓGICA ORIGINAL)
+    print(f"   🦀 Buscando no CrustData...")
     comp_info = enrich_company_basic(domain)
     
-    comp_payload = {}
+    # 5. Monta payload da empresa
     if comp_info:
         rev_low = comp_info.get("estimated_revenue_lower_bound_usd")
         rev_high = comp_info.get("estimated_revenue_higher_bound_usd")
@@ -229,53 +680,113 @@ def process_new_lead_part1(data):
             "hq": comp_info.get("headquarters"),
             "employees": comp_info.get("employee_count_range"),
             "revenue": rev,
-            "description": comp_info.get("linkedin_company_description", "")
+            "description": comp_info.get("linkedin_company_description", ""),
+            "linkedin_url": comp_info.get("linkedin_url")
         }
     else:
-        comp_payload = {"name": domain, "revenue": "N/D"}
-
+        # Fallback para Apollo
+        apollo_org = apollo_organization_search(domain)
+        if apollo_org:
+            comp_payload = {
+                "name": apollo_org.get("name", domain),
+                "employees": apollo_org.get("employee_count"),
+                "linkedin_url": apollo_org.get("linkedin_url"),
+                "revenue": "N/D"
+            }
+        else:
+            comp_payload = {"name": domain, "revenue": "N/D"}
+    
+    # 6. Classifica porte
+    employee_count = comp_payload.get("employees")
+    porte = classify_porte(brasil_data, employee_count)
+    
+    # 7. Monta mensagem de preview
     msg = f"🔎 *ANÁLISE DE LEAD (Revisão)*\n"
-    msg += f"🏢 *{clean_markdown(comp_payload.get('name'))}*\n"
+    msg += f"🏢 *{clean_markdown(comp_payload.get('name'))}*"
+    msg += f" ({porte.upper()})\n"
+    
     if comp_info:
         msg += f"📍 {clean_markdown(comp_payload.get('hq', 'N/D'))} | 👥 {comp_payload.get('employees', 'N/D')}\n"
         msg += f"💰 Rev: {comp_payload.get('revenue')}\n"
         if comp_payload.get('description'):
             msg += f"📝 _{clean_markdown(comp_payload['description'][:150])}..._\n"
     
-    msg += "----------------\n"
-    enrich_points = 20 if comp_info else 0
-    pre_score = int(tech_score * 0.5) + enrich_points
-    msg += f"📊 Score Preliminar: {pre_score}/100\n"
-
+    # 8. Dados do CNPJ (PARA TODOS)
+    if cnpj:
+        cnpj_fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+        msg += f"\n📋 *CNPJ:* {cnpj_fmt}\n"
+        if brasil_data:
+            tel_cnpj = brasil_data.get("ddd_telefone_1")
+            email_cnpj = brasil_data.get("email")
+            if tel_cnpj:
+                msg += f"📞 Cartão CNPJ: {clean_markdown(tel_cnpj)}\n"
+            if email_cnpj:
+                msg += f"📧 Cartão CNPJ: {clean_markdown(email_cnpj)}\n"
+            if socios:
+                msg += f"👥 Sócios: {len(socios)} encontrados\n"
+    
+    msg += "\n----------------\n"
+    
+    # 9. Stack tecnológica
     if tech_summary:
-        if tech_summary.get('marketing'): msg += f"📢 Mkt: {', '.join(tech_summary['marketing'])}\n"
-        if tech_summary.get('cms'): msg += f"📝 CMS: {', '.join(tech_summary['cms'])}\n"
-        if tech_summary.get('analytics'): msg += f"📈 Data: {', '.join(tech_summary['analytics'])}\n"
-        others = [t for t in techs if t not in set(tech_summary.get('marketing', []) + tech_summary.get('cms', []) + tech_summary.get('analytics', []))]
-        if others: msg += f"⚙️ Infra: {', '.join(others[:5])}\n"
+        if tech_summary.get('marketing'):
+            msg += f"📢 Mkt: {', '.join(tech_summary['marketing'][:4])}\n"
+        if tech_summary.get('cms'):
+            msg += f"📝 CMS: {', '.join(tech_summary['cms'][:3])}\n"
+        if tech_summary.get('analytics'):
+            msg += f"📈 Data: {', '.join(tech_summary['analytics'][:3])}\n"
+        others = [t for t in techs if t not in set(
+            tech_summary.get('marketing', []) + 
+            tech_summary.get('cms', []) + 
+            tech_summary.get('analytics', [])
+        )]
+        if others:
+            msg += f"⚙️ Infra: {', '.join(others[:5])}\n"
     elif techs:
         msg += f"🛠 Stack: {', '.join(techs[:6])}\n"
-        
-    msg += "----------------"
     
+    msg += "----------------\n"
+    
+    # 10. Score preliminar
+    enrich_points = 20 if comp_info else 10
+    cnpj_points = 10 if cnpj else 0
+    pre_score = int(tech_score * 0.5) + enrich_points + cnpj_points
+    msg += f"📊 Score Preliminar: {pre_score}/100"
+    
+    # 11. Salva no Firestore
     db_data = {
         "tech_score": tech_score,
         "preliminary_score": pre_score,
         "crust_company": comp_payload,
         "tech_data": techs,
         "tech_summary": tech_summary,
+        "cnpj": cnpj,
+        "brasil_data": brasil_data,
+        "socios": socios,
+        "porte": porte,
+        "site_emails": site_emails,
+        "site_socials": site_socials,
         "status": "WAITING_DECISION",
         "contacts_found": 0,
-        "last_update": datetime.datetime.now()
+        "last_update": datetime.datetime.now(),
+        "chat_id": chat_id
     }
     database.update_enrichment(domain, db_data)
+    
+    # 12. Envia preview com botões
     send_telegram_preview(chat_id, msg, domain)
+    print(f"   ✅ Preview enviado | Porte: {porte} | CNPJ: {'✅' if cnpj else '❌'}")
+
 
 # ==============================================================================
-# 🔄 PARTE 2 (ANTI-BUG)
+# 🎯 PARTE 2: ENRIQUECIMENTO DE PESSOAS
 # ==============================================================================
 
 def process_enrich_command_part2(data):
+    """
+    PARTE 2: Quando o usuário clica em "Enriquecer Pessoas"
+    Busca contatos usando CrustData (prioridade) + Apollo/Lusha (fallback)
+    """
     domain = data.get("domain")
     chat_id = data.get("chat_id")
     msg_id = data.get("message_id")
@@ -283,6 +794,7 @@ def process_enrich_command_part2(data):
     print(f"\n🟢 [Parte 2] Enriquecendo Pessoas: {domain}")
 
     try:
+        # 1. Busca lead no Firestore
         doc_ref = db_firestore.collection("leads_b2b").document(domain)
         doc = doc_ref.get()
         if not doc.exists:
@@ -294,6 +806,11 @@ def process_enrich_command_part2(data):
         techs = ld.get("tech_data", [])
         tech_summary = ld.get("tech_summary", {})
         pre_score = ld.get("preliminary_score", 0)
+        cnpj = ld.get("cnpj")
+        brasil_data = ld.get("brasil_data", {})
+        socios = ld.get("socios", [])
+        porte = ld.get("porte", "enterprise")
+        site_emails = ld.get("site_emails", [])
 
         cid = comp_info.get("id")
         cdom = comp_info.get("domain") or domain
@@ -301,50 +818,117 @@ def process_enrich_command_part2(data):
         final_people = []
         seen_ids = set()
 
-        # 1. DMs via ID (Com blindagem "or []")
+        # 2. CRUSTDATA - Decision Makers via ID (LÓGICA ORIGINAL)
         if cid:
-            print("   ↳ DMs via ID...")
-            dms = get_decision_makers_by_id(cid) or [] # <--- BLINDAGEM AQUI
+            print("   ↳ CrustData DMs via ID...")
+            dms = get_decision_makers_by_id(cid) or []
             for p in dms:
                 pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids: seen_ids.add(pid); final_people.append(p)
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    final_people.append(p)
         
-        # 2. Fallbacks via Domínio
+        # 3. CRUSTDATA - Busca por cargos (LÓGICA ORIGINAL)
         if len(final_people) < 5:
-            print("   ↳ C-Level/Mkt...")
+            print("   ↳ CrustData C-Level/Mkt...")
             res = search_people_robust(cdom, ["marketing", "growth", "revenue", "sales", "ceo", "founder", "diretor"], limit=5) or []
             for p in res:
                 pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids: seen_ids.add(pid); final_people.append(p)
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    final_people.append(p)
 
         if len(final_people) < 5:
-            print("   ↳ Gerentes...")
+            print("   ↳ CrustData Gerentes...")
             res = search_people_robust(cdom, ["manager", "gerente", "head"], limit=5) or []
             for p in res:
                 pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids: seen_ids.add(pid); final_people.append(p)
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    final_people.append(p)
 
         if len(final_people) < 5:
-            print("   ↳ Genérico...")
+            print("   ↳ CrustData Genérico...")
             res = search_people_robust(cdom, None, limit=5) or []
             for p in res:
                 pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids: seen_ids.add(pid); final_people.append(p)
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    final_people.append(p)
+
+        # 4. FALLBACK: Lusha (se CrustData não retornou suficiente)
+        if len(final_people) < 5:
+            print("   ↳ Fallback Lusha...")
+            lusha_res = lusha_people_search(domain, ["CEO", "CMO", "Marketing", "Growth"], limit=5)
+            for p in lusha_res:
+                name_key = (p.get("name") or "").lower()
+                if name_key and name_key not in seen_ids:
+                    seen_ids.add(name_key)
+                    final_people.append(p)
+
+        # 5. FALLBACK: Apollo (se ainda não tem suficiente)
+        if len(final_people) < 5:
+            print("   ↳ Fallback Apollo...")
+            apollo_res = apollo_people_search(domain, ["CEO", "Founder", "Marketing", "Growth"], limit=5)
+            for p in apollo_res:
+                name_key = (p.get("name") or "").lower()
+                if name_key and name_key not in seen_ids:
+                    seen_ids.add(name_key)
+                    final_people.append(p)
+
+        # 6. Para PME: Adiciona sócios do BrasilAPI com LinkedIn
+        if porte == "pme" and socios and len(final_people) < 5:
+            print("   ↳ Enriquecendo sócios BrasilAPI...")
+            nome_fantasia = brasil_data.get("nome_fantasia", domain) if brasil_data else domain
+            serper_calls = 0
+            
+            for socio in socios:
+                if len(final_people) >= 5 or serper_calls >= MAX_SERPER_CALLS:
+                    break
+                
+                nome = socio.get("nome")
+                if not nome:
+                    continue
+                
+                # Verifica se já não está na lista
+                nome_lower = nome.lower()
+                if nome_lower in seen_ids:
+                    continue
+                
+                serper_calls += 1
+                linkedin_url = search_linkedin_serper(nome, nome_fantasia)
+                
+                socio_contact = {
+                    "name": nome,
+                    "full_name": nome,
+                    "title": socio.get("qualificacao", "Sócio"),
+                    "faixa_etaria": socio.get("faixa_etaria"),
+                    "linkedin_url": linkedin_url,
+                    "linkedin_profile_url": linkedin_url,
+                    "source": "brasil_api"
+                }
+                
+                seen_ids.add(nome_lower)
+                final_people.append(socio_contact)
 
         final_people = final_people[:5]
-        print(f"   ✅ Pessoas: {len(final_people)}")
+        print(f"   ✅ Total Pessoas: {len(final_people)}")
 
+        # 7. Calcula score final
         final_score = pre_score + (len(final_people) * 10)
-        if final_score > 100: final_score = 100
+        if final_score > 100:
+            final_score = 100
         
+        # 8. Atualiza Firestore
         doc_ref.update({
-            "status": "SENT_TO_HUBSPOT",
+            "status": "ENRICHED",
             "people_data": final_people,
             "contacts_found": len(final_people),
             "final_score": final_score,
             "enriched_at": datetime.datetime.now()
         })
         
+        # 9. Publica para HubSpot
         payload_closer = {
             "domain": domain,
             "company_name": comp_info.get("name", domain),
@@ -353,63 +937,101 @@ def process_enrich_command_part2(data):
         }
         publisher.publish(topic_path_closer, json.dumps(payload_closer).encode("utf-8"))
         
-        # Reconstrói MSG
-        final_msg = f"🔎 *ANÁLISE DE LEAD (Final)*\n"
-        final_msg += f"🏢 *{clean_markdown(comp_info.get('name', domain))}*\n"
-        final_msg += f"📍 {clean_markdown(comp_info.get('hq', 'N/D'))} | 👥 {comp_info.get('employees', 'N/D')}\n"
+        # 10. Monta mensagem final (EDITA A MENSAGEM ORIGINAL)
+        final_msg = f"🔎 *ANÁLISE DE LEAD (Completa)*\n"
+        final_msg += f"🏢 *{clean_markdown(comp_info.get('name', domain))}* ({porte.upper()})\n"
         
-        if comp_info.get('revenue'): final_msg += f"💰 Rev: {comp_info.get('revenue')}\n"
+        if comp_info.get('hq'):
+            final_msg += f"📍 {clean_markdown(comp_info.get('hq'))} | 👥 {comp_info.get('employees', 'N/D')}\n"
+        if comp_info.get('revenue'):
+            final_msg += f"💰 Rev: {comp_info.get('revenue')}\n"
         
-        final_msg += "----------------\n"
+        # CNPJ (mantém na mensagem final)
+        if cnpj:
+            cnpj_fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+            final_msg += f"📋 CNPJ: {cnpj_fmt}\n"
         
+        final_msg += "\n----------------\n"
+        
+        # Stack
         if tech_summary:
-            if tech_summary.get('marketing'): final_msg += f"📢 Mkt: {', '.join(tech_summary['marketing'])}\n"
-            if tech_summary.get('cms'): final_msg += f"📝 CMS: {', '.join(tech_summary['cms'])}\n"
-            if tech_summary.get('analytics'): final_msg += f"📈 Data: {', '.join(tech_summary['analytics'])}\n"
-            others = [t for t in techs if t not in set(tech_summary.get('marketing', []) + tech_summary.get('cms', []) + tech_summary.get('analytics', []))]
-            if others: final_msg += f"⚙️ Infra: {', '.join(others[:4])}\n"
+            if tech_summary.get('marketing'):
+                final_msg += f"📢 Mkt: {', '.join(tech_summary['marketing'][:4])}\n"
+            if tech_summary.get('cms'):
+                final_msg += f"📝 CMS: {', '.join(tech_summary['cms'][:3])}\n"
+            if tech_summary.get('analytics'):
+                final_msg += f"📈 Data: {', '.join(tech_summary['analytics'][:3])}\n"
         elif techs:
             final_msg += f"🛠 Stack: {', '.join(techs[:5])}\n"
 
         final_msg += "----------------\n"
-        final_msg += f"✅ *ENVIADO HUBSPOT* (Score: {final_score})\n\n"
+        final_msg += f"✅ *Score: {final_score}/100* | Contatos: {len(final_people)}\n\n"
         
+        # Lista de pessoas com formato rico
         if final_people:
             for p in final_people:
                 final_msg += format_person_profile_full(p) + "\n\n"
         else:
             final_msg += "❌ Nenhuma pessoa encontrada nesta busca.\n"
 
+        # EDITA a mensagem original (não apaga)
         edit_msg_final(chat_id, msg_id, final_msg)
+        
+        # 11. ENVIA NOVA MENSAGEM com botão de Copies (NÃO APAGA A ANTERIOR)
+        copy_msg = f"✅ *{clean_markdown(comp_info.get('name', domain))}* processado!\n"
+        copy_msg += f"📊 Score: {final_score} | 👥 {len(final_people)} contatos\n\n"
+        copy_msg += "Deseja gerar copies personalizadas?"
+        
+        send_new_message_with_copies_button(chat_id, copy_msg, domain)
 
     except Exception as e:
         print(f"🔥 ERRO FATAL PARTE 2: {e}")
         traceback.print_exc()
         edit_msg_final(chat_id, msg_id, f"❌ Erro processando {domain} (Check Logs).")
 
+
 # ==============================================================================
-# 📨 CALLBACK
+# 📨 CALLBACK PRINCIPAL
 # ==============================================================================
 
 def callback(message):
+    """Callback principal do Pub/Sub"""
     try:
         data = json.loads(message.data.decode("utf-8"))
+        
         if data.get("command") == "FETCH_PEOPLE":
+            # Comando do botão "Enriquecer Pessoas"
             process_enrich_command_part2(data)
         else:
+            # Novo lead vindo do Agente 2
             process_new_lead_part1(data)
+        
         message.ack()
     except Exception as e:
         print(f"🔥 Erro Geral: {e}")
+        traceback.print_exc()
         message.nack()
 
+
+# ==============================================================================
+# 🚀 MAIN
+# ==============================================================================
+
 if __name__ == "__main__":
+    print(f"\n📡 Configuração:")
+    print(f"   - CrustData: {'✅' if CRUST_API_KEY else '❌'}")
+    print(f"   - Apollo: {'✅' if APOLLO_API_KEY else '❌'}")
+    print(f"   - Lusha: {'✅' if LUSHA_API_KEY else '❌'}")
+    print(f"   - Serper: {'✅' if SERPER_API_KEY else '❌'}")
+    
     if not CRUST_API_KEY:
-        print("❌ ERRO: CRUST_API_KEY não encontrada.")
-    else:
-        flow_control = pubsub_v1.types.FlowControl(max_messages=2)
-        print(f"💎 Agente 3 (V5.9 - Stability Patch) ouvindo...")
-        with subscriber:
-            try:
-                subscriber.subscribe(subscription_path, callback=callback, flow_control=flow_control).result()
-            except KeyboardInterrupt: pass
+        print("⚠️ AVISO: CRUST_API_KEY não configurada. Usando apenas Apollo/Lusha.")
+    
+    flow_control = pubsub_v1.types.FlowControl(max_messages=2)
+    print(f"\n💎 Agente 3 (V4.2 - Full Features) ouvindo...")
+    
+    with subscriber:
+        try:
+            subscriber.subscribe(subscription_path, callback=callback, flow_control=flow_control).result()
+        except KeyboardInterrupt:
+            print("\n👋 Agente 3 finalizado.")
