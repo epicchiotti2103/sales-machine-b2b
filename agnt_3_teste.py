@@ -1,13 +1,11 @@
-
 """
 AGENTE 3: ENRICHER PREMIUM
-SalesMachine v4.3
+SalesMachine v4.8
 
-Correções v4.3:
-- Salva mensagem de preview no Firebase
-- Ao enriquecer, CONCATENA a mensagem salva + contatos novos
-- Preserva TODOS os dados do preview (tel/email CNPJ, sócios, etc)
-- Fluxo em 2 partes preservado
+Correções v4.8:
+- Enriquece sócios para TODOS os portes (não só PME)
+- Debug adicional na busca de CNPJ
+- Mantém correções de DataStone e deduplicação
 """
 
 import os
@@ -37,7 +35,7 @@ except ImportError:
         def save_cnpj_cache(cnpj, data): pass
 
 load_dotenv()
-print("\n💎 --- AGENTE 3: ENRICHER (V4.3 - Preview Concat) ---")
+print("\n💎 --- AGENTE 3: ENRICHER (V4.8 - Sócios Universal) ---")
 
 # ==============================================================================
 # ⚙️ CONFIGURAÇÃO
@@ -52,9 +50,11 @@ CRUST_API_KEY = os.getenv("CRUST_API_KEY")
 APOLLO_API_KEY = os.getenv("APOLLO_API_KEY")
 LUSHA_API_KEY = os.getenv("LUSHA_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+DATA_STONE_API_KEY = os.getenv("DATA_STONE_API_KEY")
 
 # URLs
 CRUST_BASE_URL = "https://api.crustdata.com"
+DATA_STONE_BASE_URL = "https://docs.datastone.com.br/_mock/api"
 
 # Pub/Sub
 SUBSCRIPTION_INPUT = "sub-enricher-worker"
@@ -380,9 +380,96 @@ def extract_socios_from_brasil_api(brasil_data):
                 "nome": nome.title(),
                 "qualificacao": socio.get("qualificacao_socio", "Sócio"),
                 "faixa_etaria": socio.get("faixa_etaria"),
-                "data_entrada": socio.get("data_entrada_sociedade")
+                "data_entrada": socio.get("data_entrada_sociedade"),
+                "cpf": socio.get("cpf_cnpj_socio")  # CPF do sócio (se disponível)
             })
     return socios
+
+
+# ==============================================================================
+# 📊 DATA STONE API (Enriquecimento de Pessoa Física)
+# ==============================================================================
+
+def fetch_datastone_person_by_name(name, uf=None):
+    """
+    Consulta DataStone API para buscar dados de pessoa física por NOME
+    Usa o endpoint /persons/search
+    Retorna email e celular se encontrar
+    """
+    if not DATA_STONE_API_KEY or not name:
+        return None
+    
+    # Só converte para uppercase (como no exemplo da API)
+    nome_busca = name.upper()
+    
+    try:
+        url = f"{DATA_STONE_BASE_URL}/persons/search"
+        
+        # Header conforme documentação: Authorization: YOUR_API_KEY (sem Bearer)
+        headers = {
+            "Authorization": DATA_STONE_API_KEY
+        }
+        params = {
+            "name": nome_busca
+        }
+        # Adiciona UF se disponível para refinar a busca
+        if uf:
+            params["uf"] = uf.upper()
+        
+        print(f"   🔗 DataStone URL: {url}?name={nome_busca[:20]}...")
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        
+        # Debug em caso de erro
+        if resp.status_code != 200:
+            print(f"   ⚠️ DataStone: Status {resp.status_code} | {resp.text[:100] if resp.text else 'vazio'}")
+            return None
+        
+        # Verifica se tem conteúdo
+        if not resp.text or resp.text.strip() == "":
+            print(f"   ⚠️ DataStone: Resposta vazia")
+            return None
+        
+        data = resp.json()
+        
+        # A resposta pode ser uma lista ou um objeto
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]  # Pega o primeiro resultado
+        
+        if not data:
+            print(f"   ⚠️ DataStone: Nenhum resultado para {nome_limpo[:20]}...")
+            return None
+        
+        result = {
+            "name": data.get("name"),
+            "cpf": data.get("cpf")
+        }
+        
+        # Extrai primeiro email
+        emails = data.get("emails", [])
+        if emails and isinstance(emails, list) and len(emails) > 0:
+            if isinstance(emails[0], dict):
+                result["email"] = emails[0].get("email")
+            else:
+                result["email"] = emails[0]
+        
+        # Extrai primeiro celular
+        phones = data.get("mobile_phones", [])
+        if phones and isinstance(phones, list) and len(phones) > 0:
+            if isinstance(phones[0], dict):
+                result["phone"] = phones[0].get("phone") or phones[0].get("number")
+            else:
+                result["phone"] = phones[0]
+        
+        print(f"   📱 DataStone: {result.get('name', 'OK')[:20]}... | Email: {'✅' if result.get('email') else '❌'} | Tel: {'✅' if result.get('phone') else '❌'}")
+        return result
+        
+    except json.JSONDecodeError as e:
+        print(f"   ⚠️ DataStone: Resposta não é JSON válido")
+    except Exception as e:
+        print(f"   ⚠️ DataStone erro: {e}")
+    return None
 
 
 # ==============================================================================
@@ -644,12 +731,20 @@ def process_new_lead_part1(data):
     
     # 1. Descomprime HTML
     html_content = decompress_html(html_compressed)
+    if html_content:
+        print(f"   📄 HTML descomprimido: {len(html_content)} chars")
     
     # 2. Extrai CNPJ (PARA TODOS - PME E ENTERPRISE)
     cnpj = extract_cnpj_from_html(html_content)
     if not cnpj:
         company_name = context_data.get("name", domain.split(".")[0])
+        print(f"   🔍 Buscando CNPJ via Serper para: {company_name}")
         cnpj = search_cnpj_serper(company_name, domain)
+    
+    if cnpj:
+        print(f"   ✅ CNPJ: {cnpj[:8]}...")
+    else:
+        print(f"   ⚠️ CNPJ não encontrado")
     
     # 3. Consulta BrasilAPI (PARA TODOS)
     brasil_data = None
@@ -721,8 +816,21 @@ def process_new_lead_part1(data):
                 msg += f"📞 Cartão CNPJ: {clean_markdown(tel_cnpj)}\n"
             if email_cnpj:
                 msg += f"📧 Cartão CNPJ: {clean_markdown(email_cnpj)}\n"
+            
+            # ⭐ MOSTRA SÓCIOS COM NOME COMPLETO E FAIXA ETÁRIA
             if socios:
-                msg += f"👥 Sócios: {len(socios)} encontrados\n"
+                msg += f"\n👥 *Sócios ({len(socios)}):*\n"
+                for s in socios:
+                    nome = clean_markdown(s.get('nome', ''))
+                    qualif = clean_markdown(s.get('qualificacao', 'Sócio'))
+                    faixa = s.get('faixa_etaria')
+                    
+                    linha = f"   • {nome}"
+                    if qualif:
+                        linha += f" - {qualif}"
+                    if faixa:
+                        linha += f" ({faixa})"
+                    msg += linha + "\n"
     
     msg += "\n----------------\n"
     
@@ -818,15 +926,43 @@ def process_enrich_command_part2(data):
 
         final_people = []
         seen_ids = set()
+        seen_names = set()  # ⭐ Adiciona set de nomes para deduplicação extra
+        
+        def is_duplicate(person):
+            """Verifica se pessoa já está na lista (por ID ou nome similar)"""
+            pid = person.get("person_id") or person.get("linkedin_profile_url")
+            name = (person.get("full_name") or person.get("name") or "").lower().strip()
+            
+            # Checa por ID
+            if pid and pid in seen_ids:
+                return True
+            
+            # Checa por nome (normalizado - só primeiro e último nome)
+            if name:
+                parts = name.split()
+                if len(parts) >= 2:
+                    # Compara primeiro + último nome
+                    name_key = f"{parts[0]} {parts[-1]}"
+                else:
+                    name_key = name
+                
+                if name_key in seen_names:
+                    return True
+                
+                # Adiciona nos sets
+                seen_names.add(name_key)
+            
+            if pid:
+                seen_ids.add(pid)
+            
+            return False
 
         # 2. CRUSTDATA - Decision Makers via ID (LÓGICA ORIGINAL)
         if cid:
             print("   ↳ CrustData DMs via ID...")
             dms = get_decision_makers_by_id(cid) or []
             for p in dms:
-                pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
+                if not is_duplicate(p):
                     final_people.append(p)
         
         # 3. CRUSTDATA - Busca por cargos (LÓGICA ORIGINAL)
@@ -834,27 +970,21 @@ def process_enrich_command_part2(data):
             print("   ↳ CrustData C-Level/Mkt...")
             res = search_people_robust(cdom, ["marketing", "growth", "revenue", "sales", "ceo", "founder", "diretor"], limit=5) or []
             for p in res:
-                pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
+                if not is_duplicate(p):
                     final_people.append(p)
 
         if len(final_people) < 5:
             print("   ↳ CrustData Gerentes...")
             res = search_people_robust(cdom, ["manager", "gerente", "head"], limit=5) or []
             for p in res:
-                pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
+                if not is_duplicate(p):
                     final_people.append(p)
 
         if len(final_people) < 5:
             print("   ↳ CrustData Genérico...")
             res = search_people_robust(cdom, None, limit=5) or []
             for p in res:
-                pid = p.get("person_id") or p.get("linkedin_profile_url")
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
+                if not is_duplicate(p):
                     final_people.append(p)
 
         # 4. FALLBACK: Lusha (se CrustData não retornou suficiente)
@@ -862,9 +992,7 @@ def process_enrich_command_part2(data):
             print("   ↳ Fallback Lusha...")
             lusha_res = lusha_people_search(domain, ["CEO", "CMO", "Marketing", "Growth"], limit=5)
             for p in lusha_res:
-                name_key = (p.get("name") or "").lower()
-                if name_key and name_key not in seen_ids:
-                    seen_ids.add(name_key)
+                if not is_duplicate(p):
                     final_people.append(p)
 
         # 5. FALLBACK: Apollo (se ainda não tem suficiente)
@@ -872,73 +1000,86 @@ def process_enrich_command_part2(data):
             print("   ↳ Fallback Apollo...")
             apollo_res = apollo_people_search(domain, ["CEO", "Founder", "Marketing", "Growth"], limit=5)
             for p in apollo_res:
-                name_key = (p.get("name") or "").lower()
-                if name_key and name_key not in seen_ids:
-                    seen_ids.add(name_key)
+                if not is_duplicate(p):
                     final_people.append(p)
 
-        # 6. Para PME: Adiciona sócios do BrasilAPI com LinkedIn
-        if porte == "pme" and socios and len(final_people) < 5:
-            print("   ↳ Enriquecendo sócios BrasilAPI...")
+        # 6. SEMPRE enriquece sócios via DataStone (email/celular) - para TODOS os portes
+        # Sócios são contatos valiosos - donos da empresa
+        socios_enriquecidos = []
+        if socios and DATA_STONE_API_KEY:
+            print("   ↳ Enriquecendo sócios via DataStone...")
             nome_fantasia = brasil_data.get("nome_fantasia", domain) if brasil_data else domain
+            uf_empresa = brasil_data.get("uf") if brasil_data else None
             serper_calls = 0
             
             for socio in socios:
-                if len(final_people) >= 5 or serper_calls >= MAX_SERPER_CALLS:
-                    break
-                
                 nome = socio.get("nome")
                 if not nome:
                     continue
                 
-                # Verifica se já não está na lista
-                nome_lower = nome.lower()
-                if nome_lower in seen_ids:
-                    continue
+                # Busca LinkedIn (limitado pelo MAX_SERPER_CALLS)
+                linkedin_url = None
+                if serper_calls < MAX_SERPER_CALLS:
+                    serper_calls += 1
+                    linkedin_url = search_linkedin_serper(nome, nome_fantasia)
                 
-                serper_calls += 1
-                linkedin_url = search_linkedin_serper(nome, nome_fantasia)
+                # ⭐ SEMPRE busca email/celular via DataStone (por NOME COMPLETO)
+                print(f"   ↳ DataStone: Buscando {nome[:25]}...")
+                datastone_data = fetch_datastone_person_by_name(nome, uf=uf_empresa)
                 
-                socio_contact = {
+                email_socio = None
+                phone_socio = None
+                if datastone_data:
+                    email_socio = datastone_data.get("email")
+                    phone_socio = datastone_data.get("phone")
+                
+                socio_enriquecido = {
                     "name": nome,
                     "full_name": nome,
                     "title": socio.get("qualificacao", "Sócio"),
                     "faixa_etaria": socio.get("faixa_etaria"),
                     "linkedin_url": linkedin_url,
                     "linkedin_profile_url": linkedin_url,
-                    "source": "brasil_api"
+                    "email": email_socio,
+                    "phone": phone_socio,
+                    "source": "brasil_api" + (" + datastone" if datastone_data else "")
                 }
-                
-                seen_ids.add(nome_lower)
-                final_people.append(socio_contact)
+                socios_enriquecidos.append(socio_enriquecido)
+        
+        # 7. Adiciona sócios enriquecidos na lista (se ainda tiver espaço e não for duplicado)
+        for socio in socios_enriquecidos:
+            if not is_duplicate(socio) and len(final_people) < 5:
+                final_people.append(socio)
 
         final_people = final_people[:5]
         print(f"   ✅ Total Pessoas: {len(final_people)}")
 
-        # 7. Calcula score final
+        # 8. Calcula score final
         final_score = pre_score + (len(final_people) * 10)
         if final_score > 100:
             final_score = 100
         
-        # 8. Atualiza Firestore
+        # 9. Atualiza Firestore
         doc_ref.update({
             "status": "ENRICHED",
             "people_data": final_people,
+            "socios_enriquecidos": socios_enriquecidos,  # ⭐ Salva sócios enriquecidos separadamente
             "contacts_found": len(final_people),
             "final_score": final_score,
             "enriched_at": datetime.datetime.now()
         })
         
-        # 9. Publica para HubSpot
+        # 10. Publica para HubSpot
         payload_closer = {
             "domain": domain,
             "company_name": comp_info.get("name", domain),
             "contacts": final_people,
+            "socios": socios_enriquecidos,  # ⭐ Inclui sócios enriquecidos
             "final_score": final_score
         }
         publisher.publish(topic_path_closer, json.dumps(payload_closer).encode("utf-8"))
         
-        # 10. Monta mensagem final CONCATENANDO o preview + contatos
+        # 11. Monta mensagem final CONCATENANDO o preview + contatos
         # ⭐ USA A MENSAGEM DE PREVIEW SALVA NO FIREBASE
         if preview_message:
             # Remove o score preliminar da mensagem de preview
@@ -1039,12 +1180,13 @@ if __name__ == "__main__":
     print(f"   - Apollo: {'✅' if APOLLO_API_KEY else '❌'}")
     print(f"   - Lusha: {'✅' if LUSHA_API_KEY else '❌'}")
     print(f"   - Serper: {'✅' if SERPER_API_KEY else '❌'}")
+    print(f"   - DataStone: {'✅' if DATA_STONE_API_KEY else '❌'}")
     
     if not CRUST_API_KEY:
         print("⚠️ AVISO: CRUST_API_KEY não configurada. Usando apenas Apollo/Lusha.")
     
     flow_control = pubsub_v1.types.FlowControl(max_messages=2)
-    print(f"\n💎 Agente 3 (V4.3 - Preview Concat) ouvindo...")
+    print(f"\n💎 Agente 3 (V4.8 - Sócios Universal) ouvindo...")
     
     with subscriber:
         try:
