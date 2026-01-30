@@ -25,7 +25,7 @@ ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = [id.strip() for id in ALLOWED_USERS_RAW.split(",") if id.strip()]
 
 # Modelo mantido
-MODELO_PREFERIDO = "gemini-2.0-flash-lite-preview-02-05" 
+MODELO_PREFERIDO = "gemini-2.5-flash" 
 
 # --- MEMÓRIA VOLÁTIL ---
 user_histories = {}
